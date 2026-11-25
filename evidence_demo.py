@@ -184,6 +184,10 @@ def run(root, bench, *, conflict_protocol=False):
     passed = (
         len(set(first_request.values())) == 1
         and all(arm["boundary"].get("complete") is True for arm in arms.values())
+        and all(
+            arm["boundary"].get("relay_integrity") == "verified"
+            for arm in arms.values()
+        )
         and arms["neutral"]["claim_exposed"] is False
         and arms["neutral"]["independent_verification"] is True
         and arms["unverified"]["unsupported_acceptance"] is True

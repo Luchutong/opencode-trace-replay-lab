@@ -12,7 +12,16 @@ from hashlib import sha256
 from pathlib import Path
 
 from history import projection
-from relay import BASE_COLOR, LAYOUTS, RECORDS, digest, format_record, provider_relay
+from relay import (
+    BASE_COLOR,
+    LAYOUTS,
+    RECORDS,
+    RELAY_LOG,
+    RELAY_MANIFEST_VERSION,
+    digest,
+    format_record,
+    provider_relay,
+)
 
 ROOT = Path(__file__).resolve().parent
 BINARY = ROOT / ".runtime/node_modules/opencode-linux-x64/bin/opencode"
@@ -213,17 +222,24 @@ def sandbox(output, project, state, relay_socket, spec):
         )
 
 
-def normalize(source, out, bench):
+def normalize(source, out, bench, *, relay_log=None):
     sys.path.insert(0, str(bench / "src"))
+    from vulnmirage.hashing import atomic_write_json, sha256_file
     from vulnmirage.trace.normalize import normalize_trace
 
-    return normalize_trace(
+    result = normalize_trace(
         source,
         out,
         adapter="opencode_jsonl",
         repo_root=Path("/project"),
         framework_version=VERSION,
     )
+    if relay_log is not None:
+        manifest = result["manifest"]
+        manifest.schema_version = RELAY_MANIFEST_VERSION
+        manifest.output_sha256[relay_log.name] = sha256_file(relay_log)
+        atomic_write_json(out / "trace_manifest.json", manifest)
+    return result
 
 
 def backfill_trace(out, report):
@@ -264,13 +280,15 @@ def backfill_trace(out, report):
 def execute(root, phase, project, state, *, key, bench, spec, check_fixture=True):
     out = root / phase
     out.mkdir()
+    relay_log = out / RELAY_LOG
+    relay_log.touch(exist_ok=False)
     relay_kwargs = dict(spec.get("relay") or {})
     worker_spec = {k: v for k, v in spec.items() if k != "relay"}
     with tempfile.TemporaryDirectory(prefix="oclab-") as ipc:
         socket_path = Path(ipc) / "relay.sock"
         with provider_relay(
             socket_path,
-            out / "relay.requests.jsonl",
+            relay_log,
             key=key,
             model=MODEL,
             **relay_kwargs,
@@ -279,11 +297,9 @@ def execute(root, phase, project, state, *, key, bench, spec, check_fixture=True
     phase_report = load(out / "phase.json")
     native = normalize(out / "trace.native.jsonl", out / "native_normalized", bench)
     source = backfill_trace(out, phase_report)
-    normalized = normalize(source, out, bench)
+    normalized = normalize(source, out, bench, relay_log=relay_log)
     trace = journal(source)
-    requests = sorted(
-        journal(out / "relay.requests.jsonl"), key=lambda row: row["request"]
-    )
+    requests = sorted(journal(relay_log), key=lambda row: row["request"])
     report = {
         **phase_report,
         "normalized_status": normalized["status"],

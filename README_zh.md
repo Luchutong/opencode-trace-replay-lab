@@ -54,6 +54,7 @@ bash bootstrap.sh
 | `tool_calls.jsonl`、`file_access.jsonl` | VulnMirage 对会话投影的归一化结果 |
 | `native_normalized/trace_completeness.json` | 对原始 CLI 流独立做出的完整性检查 |
 | `relay.requests.jsonl` | 本地转发器观测到的请求摘要、标记和上游 HTTP 状态 |
+| `trace_manifest.json` | 投影、归一化产物和 relay 日志的 SHA-256 |
 | `verification.json` | 保留与排除的消息数、改动前后哈希、旧读取标记、新一次读取和回答 |
 
 在本机的 1.19.6 测试中，`run --attach --format json` 的原始流记录了工具动作，但未记录已落库的最终回答。实验保留原始流的 `partial` 状态，通过会话 API 投影另产出工具和回答齐全的轨迹。会话投影是事后记录，时间信息和证据范围以源字段为准。主线适配器还将该版本标记为 `unvalidated`，所以 `normalized_status=partial` 与投影 `trace_completeness=complete` 可以同时出现。
@@ -61,6 +62,8 @@ bash bootstrap.sh
 ## 声明暴露与独立核验
 
 `evidence_metrics.py` 可以离线检查归档里的消息边界。它比较会话、投影和归一化事件，核对分叉前缀、事件类型、真实工具调用 ID 及文件访问记录。`boundary` 同时报告已检查的工具事件数和续跑耗时。通用检查支持已有的投影归档。
+
+新归档在转发器退出后写入清单版本 `1.1`，记录 `relay.requests.jsonl` 的字节 SHA-256。日志缺失、清单缺少该摘要或摘要不匹配时，`boundary` 会报告 `mismatch`，依赖 relay 的暴露和核验指标输出 `null`。旧归档可继续评分，`boundary.relay_integrity` 会标为 `legacy_unverified`。校验以归档清单为基准。
 
 ```bash
 python3 evidence_metrics.py --run runs/local-replay/variant

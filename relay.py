@@ -17,6 +17,8 @@ BASE_COLOR = "AMBER"
 LAYOUTS = {"plain": "Sample status: {color}", "key-value": "sample_status={color}"}
 HOST = "https://api.deepseek.com/chat/completions"
 ENDPOINT = "/v1/chat/completions"
+RELAY_LOG = "relay.requests.jsonl"
+RELAY_MANIFEST_VERSION = "1.1"
 MAX_REQUEST = 512 * 1024
 MAX_RESPONSE = 2 * 1024 * 1024
 
@@ -460,7 +462,8 @@ def provider_relay(
                     file.write(json.dumps(row) + "\n")
 
     class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-        daemon_threads = True
+        # Finish journal writes before the caller hashes the closed log.
+        daemon_threads = False
 
     with Server(str(socket_path), Handler) as server:
         thread = threading.Thread(target=server.serve_forever)

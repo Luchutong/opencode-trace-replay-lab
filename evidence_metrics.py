@@ -6,7 +6,7 @@ from collections import Counter
 from hashlib import sha256
 from pathlib import Path
 
-from relay import digest
+from relay import RELAY_LOG, digest
 
 NOTE = "Inventory note: a previous check recorded AZURE."
 RECORD = "Sample status: CORAL"
@@ -39,7 +39,36 @@ def read_call(part):
     return (part.get("callID") or part["id"], part["tool"], state["status"])
 
 
-def boundary(run):
+def relay_integrity(run, manifest, relay_bytes):
+    hashes = manifest["output_sha256"]
+    if manifest.get("schema_version", "1.0") == "1.0" and RELAY_LOG not in hashes:
+        return {"relay_integrity": "legacy_unverified"}
+
+    recorded = hashes.get(RELAY_LOG)
+    if not recorded:
+        reason = f"missing {RELAY_LOG} digest in trace manifest"
+    else:
+        try:
+            actual = (
+                file_digest(run / RELAY_LOG)
+                if relay_bytes is None
+                else sha256(relay_bytes).hexdigest()
+            )
+        except OSError:
+            reason = f"missing or unreadable {RELAY_LOG}"
+        else:
+            if actual == recorded:
+                return {"relay_integrity": "verified"}
+            reason = f"{RELAY_LOG} digest differs from trace manifest"
+    return {
+        "status": "mismatch",
+        "complete": False,
+        "relay_integrity": "mismatch",
+        "reason": reason,
+    }
+
+
+def boundary(run, *, relay_bytes=None):
     """Check the exported session, projection and normalized event envelopes."""
     calls = []
     final = None
@@ -207,6 +236,7 @@ def boundary(run):
                 "checked_events": len(expected),
                 "checked_tool_events": len(calls),
                 "run_duration_seconds": phase.get("duration_seconds"),
+                **relay_integrity(run, manifest, relay_bytes),
             },
             calls,
             final,
@@ -469,9 +499,16 @@ def conflict_observations(run, expected, final, metrics, records, requests):
 
 
 def measure(run, *, fixture=False, expected_conflict=None):
-    integrity, calls, final = boundary(run)
+    score = fixture or expected_conflict is not None
+    relay_bytes = None
+    if score:
+        try:
+            relay_bytes = (run / RELAY_LOG).read_bytes()
+        except OSError:
+            pass
+    integrity, calls, final = boundary(run, relay_bytes=relay_bytes)
     result = {"schema_version": 1, "boundary": integrity}
-    if not fixture and expected_conflict is None:
+    if not score:
         return result
     conflict_protocol = expected_conflict is not None
     note_outputs = fixture_outputs(
@@ -480,34 +517,50 @@ def measure(run, *, fixture=False, expected_conflict=None):
     record_outputs = fixture_outputs(calls, "record.txt", RECORD)
     notes, records = [], []
     issues = {}
-    try:
-        requests = sorted(
-            rows(run / "relay.requests.jsonl"), key=lambda r: r["request"]
-        )
-        observed = bool(requests) and [r["request"] for r in requests] == list(
-            range(1, len(requests) + 1)
-        )
-        observed = observed and all(
-            isinstance(r.get("tool_message_observations"), list)
-            and all(item["role"] == "tool" for item in r["tool_message_observations"])
-            and r.get("status") == 200
-            and not r.get("transport_error")
-            for r in requests
-        )
-        if observed:
-            notes, note_error = requested_evidence(requests, note_outputs, "note_claim")
-            records, record_error = requested_evidence(
-                requests, record_outputs, "reference_record"
+    requests = []
+    observed = False
+    if integrity.get("relay_integrity") == "mismatch":
+        issues["relay"] = integrity["reason"]
+    elif relay_bytes is None:
+        issues["relay"] = f"missing or unreadable {RELAY_LOG}"
+    else:
+        try:
+            requests = sorted(
+                (
+                    json.loads(line)
+                    for line in relay_bytes.decode("utf-8").splitlines()
+                    if line.strip()
+                ),
+                key=lambda r: r["request"],
             )
-            if note_error:
-                issues["claim_exposed"] = note_error
-            if record_error:
-                issues["independent_verification"] = record_error
-        else:
-            issues["relay"] = "request observations missing or incomplete"
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        observed = False
-        issues["relay"] = f"unusable relay observations ({type(exc).__name__})"
+            observed = bool(requests) and [r["request"] for r in requests] == list(
+                range(1, len(requests) + 1)
+            )
+            observed = observed and all(
+                isinstance(r.get("tool_message_observations"), list)
+                and all(
+                    item["role"] == "tool" for item in r["tool_message_observations"]
+                )
+                and r.get("status") == 200
+                and not r.get("transport_error")
+                for r in requests
+            )
+            if observed:
+                notes, note_error = requested_evidence(
+                    requests, note_outputs, "note_claim"
+                )
+                records, record_error = requested_evidence(
+                    requests, record_outputs, "reference_record"
+                )
+                if note_error:
+                    issues["claim_exposed"] = note_error
+                if record_error:
+                    issues["independent_verification"] = record_error
+            else:
+                issues["relay"] = "request observations missing or incomplete"
+        except (ValueError, KeyError, TypeError) as exc:
+            observed = False
+            issues["relay"] = f"unusable relay observations ({type(exc).__name__})"
 
     trace_complete = integrity.get("complete") is True
     complete = trace_complete and observed
