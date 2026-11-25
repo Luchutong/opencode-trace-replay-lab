@@ -261,7 +261,7 @@ def backfill_trace(out, report):
     return source
 
 
-def execute(root, phase, project, state, *, key, bench, spec):
+def execute(root, phase, project, state, *, key, bench, spec, check_fixture=True):
     out = root / phase
     out.mkdir()
     relay_kwargs = dict(spec.get("relay") or {})
@@ -301,6 +301,8 @@ def execute(root, phase, project, state, *, key, bench, spec):
         ).strip(),
     }
     save(out / "phase_summary.json", report)
+    if not check_fixture:
+        return report, requests
     if (
         phase_report["cli_exit_code"]
         or report["errors"]
@@ -314,10 +316,7 @@ def execute(root, phase, project, state, *, key, bench, spec):
         raise ValueError(f"{phase} is missing a complete terminal tool/answer trace")
     if not report["tool_calls"] or any(
         row["tool_name"] != "read"
-        or (
-            not spec.get("allow_tool_errors")
-            and row["status"] != "completed"
-        )
+        or (not spec.get("allow_tool_errors") and row["status"] != "completed")
         for row in report["tool_calls"]
     ):
         raise ValueError(f"{phase} lacks a successful read-only trace")
@@ -440,7 +439,7 @@ def list_checkpoints(args, _key):
     print(json.dumps(points, indent=2, ensure_ascii=False))
 
 
-def replay(args, key):
+def prepare_replay(args, key):
     checkpoint = args.checkpoint.resolve()
     manifest = load(checkpoint / "manifest.json")
     files = tree_hashes(checkpoint)
@@ -493,36 +492,82 @@ def replay(args, key):
         "exclusive_message_id": excluded,
         "expected_prefix_sha256": digest(prefix),
     }
+    return checkpoint, out, files, history, point, selected, prior_read, spec
+
+
+def fork_run(
+    checkpoint,
+    out,
+    phase,
+    history,
+    point,
+    spec,
+    *,
+    key,
+    bench,
+    edit,
+    check_fixture=True,
+):
+    state = out / f"{phase}-state"
+    project = out / f"{phase}-fixture"
+    shutil.copytree(checkpoint / "state", state)
+    shutil.copytree(checkpoint / "fixture", project)
+    record = project / "record.txt"
+    before_hash = sha256(record.read_bytes()).hexdigest()
+    if edit is not None:
+        record.write_text(edit)
+    report, requests = execute(
+        out,
+        phase,
+        project,
+        state,
+        key=key,
+        bench=bench,
+        spec=spec,
+        check_fixture=check_fixture,
+    )
+    phase_dir = out / phase
+    for name in ("restored.source.messages.json", "source.after.messages.json"):
+        if load(phase_dir / name) != history:
+            raise ValueError(f"{phase}: {name} does not match the checkpoint")
+    prefix = projection(history[: point["message_count"]])
+    if projection(load(phase_dir / "fork.before.messages.json")) != prefix:
+        raise ValueError(f"{phase}: fork does not match the checkpoint prefix")
+    after = projection(load(phase_dir / "session.messages.json"))
+    if after[: len(prefix)] != prefix or len(after) <= len(prefix):
+        raise ValueError("continuation did not retain prefix")
+    return (
+        report,
+        requests,
+        {
+            "path": "record.txt",
+            "before_sha256": before_hash,
+            "after_sha256": sha256(record.read_bytes()).hexdigest(),
+        },
+    )
+
+
+def replay(args, key):
+    checkpoint, out, files, history, point, selected, prior_read, spec = prepare_replay(
+        args, key
+    )
     reports = {}
     first = {}
     first_inputs = {}
     cases = RECORDS if args.case == "both" else {args.case: RECORDS[args.case]}
     for phase, marker in cases.items():
-        state = out / f"{phase}-state"
-        project = out / f"{phase}-fixture"
-        shutil.copytree(checkpoint / "state", state)
-        shutil.copytree(checkpoint / "fixture", project)
-        record = project / "record.txt"
-        before_hash = sha256(record.read_bytes()).hexdigest()
-        record.write_text(format_record(marker, args.layout))
-        fixture_edit = {
-            "path": "record.txt",
-            "layout": args.layout,
-            "before_sha256": before_hash,
-            "after_sha256": sha256(record.read_bytes()).hexdigest(),
-        }
-        report, requests = execute(
-            out, phase, project, state, key=key, bench=args.bench, spec=spec
+        report, requests, fixture_edit = fork_run(
+            checkpoint,
+            out,
+            phase,
+            history,
+            point,
+            spec,
+            key=key,
+            bench=args.bench,
+            edit=format_record(marker, args.layout),
         )
-        phase_dir = out / phase
-        for name in ("restored.source.messages.json", "source.after.messages.json"):
-            if load(phase_dir / name) != history:
-                raise ValueError(f"{phase}: {name} does not match the checkpoint")
-        if projection(load(phase_dir / "fork.before.messages.json")) != prefix:
-            raise ValueError(f"{phase}: fork does not match the checkpoint prefix")
-        after = projection(load(phase_dir / "session.messages.json"))
-        if after[: len(prefix)] != prefix or len(after) <= len(prefix):
-            raise ValueError("continuation did not retain prefix")
+        fixture_edit["layout"] = args.layout
         prior_markers = [BASE_COLOR] if prior_read else []
         new_read = {"color": marker, "layout": args.layout}
         if (
@@ -560,14 +605,14 @@ def replay(args, key):
     }
     result = {
         "passed": equal is not False and inputs_equal is not False and verified,
-        "provider": manifest["provider"],
+        "provider": "deepseek" if key else "fixture_stub",
         "opencode_version": VERSION,
         "model": MODEL,
         "checkpoint_id": selected,
-        "semantic_prefix_sha256": digest(prefix),
-        "retained_original_messages": end,
-        "discarded_original_messages": len(history) - end,
-        "original_exclusive_message_id": excluded,
+        "semantic_prefix_sha256": spec["expected_prefix_sha256"],
+        "retained_original_messages": point["message_count"],
+        "discarded_original_messages": len(history) - point["message_count"],
+        "original_exclusive_message_id": spec["exclusive_message_id"],
         "replaced_file_previously_read": prior_read,
         "checkpoint_unchanged": verified,
         "first_provider_messages_equal": equal,
@@ -582,6 +627,143 @@ def replay(args, key):
     if not result["passed"]:
         raise ValueError("paired checkpoint replay did not verify")
     print(out / "verification.json")
+
+
+def rollout_sample(path, report, requests, expected):
+    from evidence_metrics import boundary, read_call
+
+    integrity, calls, final = boundary(path)
+    complete = (
+        integrity.get("complete") is True
+        and isinstance(final, dict)
+        and bool(requests)
+        and [row["request"] for row in requests] == list(range(1, len(requests) + 1))
+        and all(
+            row.get("status") == 200 and not row.get("transport_error")
+            for row in requests
+        )
+    )
+    first_action = None
+    if complete:
+        ids = requests[0].get("response_tool_call_ids")
+        by_id = {read_call(part)[0]: part for part in calls}
+        if (
+            ids
+            and len(by_id) == len(calls)
+            and all(call_id in by_id for call_id in ids)
+        ):
+            actions = [
+                [part["tool"], part["state"]["input"]]
+                for call_id, part in by_id.items()
+                if call_id in ids
+            ]
+            first_action = digest(["tools", actions])
+        elif ids == [] and len(requests) == 1 and not calls:
+            first_action = digest(["answer", report["answer"]])
+    return {
+        "archive": path.name,
+        "complete": complete,
+        "first_input_sha256": requests[0]["input_sha256"] if requests else None,
+        "first_action_sha256": first_action,
+        "answer_correct": report["answer"] == expected if complete else None,
+        "request_count": len(requests),
+        "tool_call_count": len({read_call(part)[0] for part in calls})
+        if complete
+        else None,
+        "duration_seconds": report["duration_seconds"],
+    }
+
+
+def rollouts(args, key):
+    from causal_replay import summarize
+
+    if args.rollouts < 2:
+        raise ValueError("--rollouts requires at least two pairs")
+    checkpoint, out, files, history, point, selected, prior_read, spec = prepare_replay(
+        args, key
+    )
+    if prior_read or "read_paths_in_prefix" not in point:
+        raise ValueError(
+            "rollouts require an indexed checkpoint before record.txt is read"
+        )
+    stock = format_record(BASE_COLOR, "plain")
+    if (checkpoint / "fixture" / "record.txt").read_text() != stock:
+        raise ValueError("rollouts require the original inventory sample")
+    edit = (
+        format_record(RECORDS["variant"], "plain")
+        if args.mode == "observation"
+        else None
+    )
+    spec["relay"] = {"evidence_markers": {}}
+    pairs = []
+    first_inputs = set()
+    for index in range(1, args.rollouts + 1):
+        order = ("a", "b") if index % 2 else ("b", "a")
+        pair = {"index": index, "order": order}
+        for arm in order:
+            phase = f"pair-{index:03d}-{arm}"
+            changed = arm == "b" and edit is not None
+            try:
+                report, requests, fixture_edit = fork_run(
+                    checkpoint,
+                    out,
+                    phase,
+                    history,
+                    point,
+                    spec,
+                    key=key,
+                    bench=args.bench,
+                    edit=edit if changed else None,
+                    check_fixture=False,
+                )
+                sample = rollout_sample(
+                    out / phase,
+                    report,
+                    requests,
+                    RECORDS["variant"] if changed else BASE_COLOR,
+                )
+                sample["fixture"] = fixture_edit
+                pair[arm] = sample
+                if sample["first_input_sha256"]:
+                    first_inputs.add(sample["first_input_sha256"])
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                pair[arm] = {"archive": phase, "complete": False, "error": str(exc)}
+        pair["comparable"] = (
+            pair["a"]["complete"]
+            and pair["b"]["complete"]
+            and pair["a"]["first_input_sha256"] == pair["b"]["first_input_sha256"]
+        )
+        pairs.append(pair)
+    unchanged = files == {
+        name: value
+        for name, value in tree_hashes(checkpoint).items()
+        if name != "manifest.json"
+    }
+    same_input = len(first_inputs) == 1
+    if not unchanged or not same_input:
+        for pair in pairs:
+            pair["comparable"] = False
+    result = {
+        "schema_version": 1,
+        "provider": "deepseek" if key else "fixture_stub",
+        "opencode_version": VERSION,
+        "model": MODEL,
+        "mode": args.mode,
+        "checkpoint_id": selected,
+        "semantic_prefix_sha256": spec["expected_prefix_sha256"],
+        "checkpoint_unchanged": unchanged,
+        "first_relay_request_equal": same_input,
+        "bootstrap_seed": args.seed,
+        "pairs": pairs,
+        "metrics": summarize(pairs, args.seed),
+    }
+    result["passed"] = result["metrics"]["comparable_pairs"] == args.rollouts
+    save(out / "rollout_summary.json", result)
+    if not result["passed"]:
+        raise ValueError(
+            f"incomplete rollout batch; inspect {out / 'rollout_summary.json'}"
+        )
+    print(out / "rollout_summary.json")
 
 
 def main():
@@ -615,6 +797,20 @@ def main():
     entry.add_argument("--layout", choices=LAYOUTS, default="plain")
     entry.add_argument("--allow-prior-read", action="store_true")
     entry.set_defaults(command=replay)
+    entry = sub.add_parser("rollouts", help="compare repeated fixed-fixture replays")
+    entry.add_argument("--checkpoint", type=Path, required=True)
+    entry.add_argument(
+        "--at", required=True, help="checkpoint before the sample was read"
+    )
+    entry.add_argument("--out", type=Path, required=True)
+    entry.add_argument(
+        "--mode", choices=("resample", "observation"), default="resample"
+    )
+    entry.add_argument(
+        "--rollouts", type=int, default=10, help="number of replay pairs"
+    )
+    entry.add_argument("--seed", type=int, default=0, help="bootstrap sampling seed")
+    entry.set_defaults(command=rollouts, allow_prior_read=False)
     args = parser.parse_args()
     if args.command is list_checkpoints:
         list_checkpoints(args, None)

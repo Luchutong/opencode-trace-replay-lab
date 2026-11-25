@@ -93,10 +93,9 @@ def read_body(handler):
     return handler.rfile.read(size)
 
 
-def streamed_tool_ids(chunk):
-    """Read only structured tool IDs from the provider's SSE data lines."""
+def streamed_deltas(chunk):
     for line in chunk.splitlines():
-        if not line.startswith(b"data:") or b'"tool_calls"' not in line:
+        if not line.startswith(b"data:"):
             continue
         try:
             data = json.loads(line[5:])
@@ -106,23 +105,29 @@ def streamed_tool_ids(chunk):
         if not isinstance(choices, list):
             continue
         for choice in choices:
-            delta = choice.get("delta") if isinstance(choice, dict) else None
-            calls = delta.get("tool_calls") if isinstance(delta, dict) else None
-            if not isinstance(calls, list):
-                continue
-            for call in calls:
-                if not isinstance(call, dict):
-                    continue
-                call_id = call.get("id")
-                if isinstance(call_id, str) and call_id:
-                    yield call_id
+            if isinstance(choice, dict) and choice.get("index", 0) == 0:
+                delta = choice.get("delta")
+                if isinstance(delta, dict):
+                    yield delta
 
 
-def tapped(chunks, needle_map=None, record_tool_ids=False):
+def delta_tool_ids(delta):
+    calls = delta.get("tool_calls")
+    if isinstance(calls, list):
+        for call in calls:
+            call_id = call.get("id") if isinstance(call, dict) else None
+            if isinstance(call_id, str) and call_id:
+                yield call_id
+
+
+def tapped(chunks, needle_map=None, record_tool_ids=False, progress_sha256=None):
     """Pass stream bytes through untouched while collecting usage and needle hits."""
     seen = []
     hits = set()
-    tool_ids = set()
+    tool_events = {}
+    progress = None
+    visible = ""
+    ordinal = 0
     for chunk in chunks:
         if b'"usage"' in chunk:
             seen.append(chunk)
@@ -131,12 +136,34 @@ def tapped(chunks, needle_map=None, record_tool_ids=False):
                 if needle.encode() in chunk:
                     hits.add(name)
         if record_tool_ids:
-            tool_ids.update(streamed_tool_ids(chunk))
+            for delta in streamed_deltas(chunk):
+                ordinal += 1
+                for call_id in delta_tool_ids(delta):
+                    tool_events.setdefault(call_id, ordinal)
+                content = delta.get("content")
+                if progress_sha256 and visible is not None and isinstance(content, str):
+                    visible += content
+                    if len(visible) > 2048:
+                        visible = None
+                    elif visible.rstrip().endswith("}"):
+                        try:
+                            value = json.loads(visible)
+                        except ValueError:
+                            pass
+                        else:
+                            if (
+                                isinstance(value, dict)
+                                and digest(value) == progress_sha256
+                            ):
+                                progress = ordinal
+                                visible = None
         yield chunk
     yield {
         "usage_chunks": seen,
         "needle_hits": sorted(hits),
-        "tool_call_ids": sorted(tool_ids),
+        "tool_call_ids": sorted(tool_events),
+        "tool_events": tool_events,
+        "progress_event": progress,
     }
 
 
@@ -279,6 +306,7 @@ def provider_relay(
     allowed_tools=None,
     needles=None,
     evidence_markers=None,
+    progress_sha256=None,
     stub_fn=None,
     upstream_timeout=25,
     disable_thinking=True,
@@ -356,7 +384,7 @@ def provider_relay(
                 )
             started = time.monotonic()
             summary = None
-            record_ids = evidence_markers is not None
+            record_ids = evidence_markers is not None or progress_sha256 is not None
             try:
                 if key is None:
                     row["status"] = 200
@@ -364,7 +392,12 @@ def provider_relay(
                         self,
                         200,
                         "text/event-stream",
-                        tapped((stub_fn or stub)(body), needles, record_ids),
+                        tapped(
+                            (stub_fn or stub)(body),
+                            needles,
+                            record_ids,
+                            progress_sha256,
+                        ),
                     )
                 else:
                     body["max_tokens"] = max_tokens
@@ -385,7 +418,10 @@ def provider_relay(
                                 "x-request-id"
                             )
                             stream = tapped(
-                                iter(response.readline, b""), needles, record_ids
+                                iter(response.readline, b""),
+                                needles,
+                                record_ids,
+                                progress_sha256,
                             )
                             summary = reply(
                                 self,
@@ -416,6 +452,9 @@ def provider_relay(
                     row["response_markers"] = summary["needle_hits"]
                     if record_ids:
                         row["response_tool_call_ids"] = summary["tool_call_ids"]
+                    if progress_sha256 is not None:
+                        row["response_progress_event"] = summary["progress_event"]
+                        row["response_tool_call_events"] = summary["tool_events"]
                 row["duration_seconds"] = round(time.monotonic() - started, 3)
                 with lock, log.open("a", encoding="utf-8") as file:
                     file.write(json.dumps(row) + "\n")
